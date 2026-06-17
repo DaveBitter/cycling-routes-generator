@@ -2,12 +2,14 @@ name: Weekly Cycling Routes
 
 on:
   schedule:
-    - cron: '0 6 * * 1'  # Every Monday at 6am UTC = ~8am Netherlands time
-  workflow_dispatch:      # Also allows manual trigger from GitHub UI
+    - cron: '0 6 * * 1'  # Every Monday at 6am UTC (~8am Netherlands)
+  workflow_dispatch:      # Manual trigger from GitHub UI
 
 jobs:
   generate-routes:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write     # Needed to commit GPX files back to repo
 
     steps:
       - name: Checkout repo
@@ -19,13 +21,22 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests Pillow
+        run: pip install requests matplotlib
 
       - name: Generate routes and send email
         env:
-          ORS_API_KEY: ${{ secrets.ORS_API_KEY }}
-          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-          RESEND_FROM: ${{ secrets.RESEND_FROM }}
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
-          START_ADDRESS: 'Cremerstraat, Haarlem, Netherlands'
+          ORS_API_KEY:        ${{ secrets.ORS_API_KEY }}
+          RESEND_API_KEY:     ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM:        ${{ secrets.RESEND_FROM }}
+          EMAIL_TO:           ${{ secrets.EMAIL_TO }}
+          START_ADDRESS:      'Cremerstraat, Haarlem, Netherlands'
+          GITHUB_REPOSITORY:  ${{ github.repository }}
         run: python generate_routes.py
+
+      - name: Commit GPX files to repo
+        run: |
+          git config user.email "github-actions@github.com"
+          git config user.name "GitHub Actions"
+          git add routes/
+          git diff --staged --quiet || git commit -m "Routes week $(date +%Y-%V)"
+          git push
