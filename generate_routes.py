@@ -18,13 +18,14 @@ import sys
 from datetime import datetime
 
 try:
+    from PIL import Image, ImageDraw
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     IMAGING = True
 except ImportError:
     IMAGING = False
-    print("Warning: matplotlib not available, skipping map images")
+    print("Warning: imaging libs not available, skipping map images")
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -126,86 +127,138 @@ def geojson_to_gpx(geojson, distance_km, date_str):
     return '\n'.join(lines), actual_km
 
 
-# ─── Map rendering ───────────────────────────────────────────────────────────
+# ─── Map rendering (OSM tiles + PIL) ────────────────────────────────────────
 
 def render_route_image(geojson, distance_km, actual_km, geoapify_key=''):
-    """Try Geoapify static map first; fall back to matplotlib."""
     coords = geojson['features'][0]['geometry']['coordinates']
-
-    if geoapify_key:
-        img = _render_geoapify(coords, distance_km, actual_km, geoapify_key)
-        if img:
-            return img
-        print("  Geoapify failed, falling back to matplotlib")
-
+    img = _render_osm_tiles(coords, distance_km, actual_km)
+    if img:
+        return img
     return _render_matplotlib(coords, distance_km, actual_km)
 
 
-def _render_geoapify(coords, distance_km, actual_km, api_key):
-    """Fetch a static map image from Geoapify with the route drawn on it."""
+def _osm_tile_xy(lat, lon, zoom):
+    lat_r = math.radians(lat)
+    n = 2 ** zoom
+    x = int((lon + 180) / 360 * n)
+    y = int((1 - math.log(math.tan(lat_r) + 1 / math.cos(lat_r)) / math.pi) / 2 * n)
+    return x, y
+
+
+def _tile_top_left(tx, ty, zoom):
+    n = 2 ** zoom
+    lon = tx / n * 360 - 180
+    lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * ty / n))))
+    return lat, lon
+
+
+def _fetch_tile(tx, ty, zoom):
     import urllib.request as urlreq
+    url = f"https://tile.openstreetmap.org/{zoom}/{tx}/{ty}.png"
     try:
-        lons = [c[0] for c in coords]
+        req = urlreq.Request(url, headers={
+            'User-Agent': 'WeeklyCyclingRoutes/1.0 (daveybitter@gmail.com)'
+        })
+        with urlreq.urlopen(req, timeout=8) as r:
+            return Image.open(io.BytesIO(r.read())).convert('RGB')
+    except Exception:
+        return None
+
+
+def _render_osm_tiles(coords, distance_km, actual_km):
+    if not IMAGING:
+        return None
+    try:
         lats = [c[1] for c in coords]
+        lons = [c[0] for c in coords]
+        pad = 0.015
+        min_lat, max_lat = min(lats) - pad, max(lats) + pad
+        min_lon, max_lon = min(lons) - pad, max(lons) + pad
 
-        # Keep max 20 points
-        step = max(1, len(coords) // 20)
-        simplified = coords[::step][:20]
+        # Pick zoom so we get ≤ 16 tiles
+        zoom = 13
+        for z in range(13, 9, -1):
+            tx0, ty0 = _osm_tile_xy(max_lat, min_lon, z)
+            tx1, ty1 = _osm_tile_xy(min_lat, max_lon, z)
+            if (tx1 - tx0 + 1) * (ty1 - ty0 + 1) <= 16:
+                zoom = z
+                break
 
-        polyline_pts = '|'.join(f'{c[0]:.4f},{c[1]:.4f}' for c in simplified)
+        tx0, ty0 = _osm_tile_xy(max_lat, min_lon, zoom)
+        tx1, ty1 = _osm_tile_xy(min_lat, max_lon, zoom)
+        T = 256
+        W = (tx1 - tx0 + 1) * T
+        H = (ty1 - ty0 + 1) * T
+        canvas = Image.new('RGB', (W, H), (200, 200, 200))
 
-        span = max(max(lats) - min(lats), max(lons) - min(lons))
-        zoom = 13 if span < 0.05 else 12 if span < 0.1 else 11 if span < 0.2 else 10 if span < 0.4 else 9
+        for tx in range(tx0, tx1 + 1):
+            for ty in range(ty0, ty1 + 1):
+                tile = _fetch_tile(tx, ty, zoom)
+                if tile:
+                    canvas.paste(tile, ((tx - tx0) * T, (ty - ty0) * T))
 
-        cx = (min(lons) + max(lons)) / 2
-        cy = (min(lats) + max(lats)) / 2
-        sx, sy = coords[0][0], coords[0][1]
+        # lat/lon → pixel
+        top_lat, left_lon = _tile_top_left(tx0, ty0, zoom)
+        bot_lat, right_lon = _tile_top_left(tx1 + 1, ty1 + 1, zoom)
 
-        # Use urllib so the URL is sent as-is (requests re-encodes '|' → '%7C')
-        url = (
-            f"https://maps.geoapify.com/v1/staticmap"
-            f"?style=osm-bright&width=800&height=560&zoom={zoom}"
-            f"&center=lonlat:{cx:.4f},{cy:.4f}"
-            f"&geometry=polyline:E74C3C,4,1|{polyline_pts}"
-            f"&marker=lonlat:{sx:.4f},{sy:.4f};type:circle;color:%23E74C3C;size:medium"
-            f"&apiKey={api_key}"
-        )
+        def px(lat, lon):
+            x = int((lon - left_lon) / (right_lon - left_lon) * W)
+            y = int((top_lat - lat) / (top_lat - bot_lat) * H)
+            return x, y
 
-        req = urlreq.Request(url, headers={'User-Agent': 'WeeklyCyclingRoutes/1.0'})
-        with urlreq.urlopen(req, timeout=20) as resp:
-            if resp.status == 200:
-                return resp.read()
-            print(f"  Geoapify HTTP {resp.status}")
-            return None
+        draw = ImageDraw.Draw(canvas)
+        pixels = [px(c[1], c[0]) for c in coords]
+
+        # Draw route: dark shadow then red line
+        for i in range(len(pixels) - 1):
+            draw.line([pixels[i], pixels[i+1]], fill=(0, 0, 0), width=5)
+        for i in range(len(pixels) - 1):
+            draw.line([pixels[i], pixels[i+1]], fill=(220, 50, 50), width=3)
+
+        # Start dot
+        sx, sy = pixels[0]
+        draw.ellipse([sx-7, sy-7, sx+7, sy+7], fill='white', outline=(220, 50, 50), width=3)
+
+        # Label
+        draw.rectangle([6, 6, 160, 24], fill=(255, 255, 255, 220))
+        draw.text((10, 8), f'{distance_km}km · actual {actual_km}km', fill=(40, 40, 40))
+
+        # Crop to 800×560 centred on route
+        cx, cy = px((min_lat + max_lat) / 2, (min_lon + max_lon) / 2)
+        FW, FH = 800, 560
+        x0 = max(0, min(cx - FW // 2, W - FW))
+        y0 = max(0, min(cy - FH // 2, H - FH))
+        final = canvas.crop((x0, y0, x0 + FW, y0 + FH))
+
+        buf = io.BytesIO()
+        final.save(buf, 'PNG', optimize=True)
+        buf.seek(0)
+        return buf.getvalue()
     except Exception as e:
-        print(f"  Geoapify error: {e}")
+        print(f"  OSM tile render failed: {e}")
         return None
 
 
 def _render_matplotlib(coords, distance_km, actual_km):
-    """Fallback: clean route chart with matplotlib (no tile server needed)."""
+    """Fallback: clean dark chart when tiles unavailable."""
     if not IMAGING:
         return None
     try:
         lons = [c[0] for c in coords]
         lats = [c[1] for c in coords]
-
         fig, ax = plt.subplots(figsize=(10, 6.5))
         fig.patch.set_facecolor('#1a1a2e')
         ax.set_facecolor('#16213e')
-        ax.plot(lons, lats, '-', color='#ff6b6b', linewidth=1.5, alpha=0.3, zorder=2)
-        ax.plot(lons, lats, '-', color='#ff6b6b', linewidth=2.5, zorder=3)
+        ax.plot(lons, lats, '-', color='#ff6b6b', linewidth=2.5)
         ax.plot(lons[0], lats[0], 'o', color='white', markersize=10,
-                markeredgecolor='#ff6b6b', markeredgewidth=2, zorder=5)
+                markeredgecolor='#ff6b6b', markeredgewidth=2)
         ax.set_aspect('equal')
         ax.tick_params(colors='#666', labelsize=7)
         for spine in ax.spines.values():
             spine.set_edgecolor('#333')
-        ax.grid(True, color='#ffffff', alpha=0.05, linewidth=0.5)
-        ax.set_title(f'{distance_km}km · actual {actual_km}km · Cremerstraat, Haarlem',
-                     color='#cccccc', fontsize=11, pad=10)
-        ax.annotate('N ↑', xy=(0.97, 0.97), xycoords='axes fraction',
-                    ha='right', va='top', color='#888', fontsize=9)
+        ax.grid(True, color='#ffffff', alpha=0.05)
+        ax.set_title(f'{distance_km}km · actual {actual_km}km · Haarlem',
+                     color='#ccc', fontsize=11, pad=10)
         plt.tight_layout()
         buf = io.BytesIO()
         plt.savefig(buf, format='PNG', dpi=130, bbox_inches='tight',
@@ -214,7 +267,7 @@ def _render_matplotlib(coords, distance_km, actual_km):
         buf.seek(0)
         return buf.getvalue()
     except Exception as e:
-        print(f"  matplotlib render failed: {e}")
+        print(f"  matplotlib failed: {e}")
         return None
 
 

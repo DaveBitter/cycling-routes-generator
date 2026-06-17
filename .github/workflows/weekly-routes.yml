@@ -21,7 +21,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests matplotlib
+        run: pip install requests matplotlib Pillow
 
       - name: Generate routes and send email
         env:
