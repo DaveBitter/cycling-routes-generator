@@ -1,5 +1,5 @@
 config.json
 *.log
-week_*/
+!routes/
 __pycache__/
 *.pyc
