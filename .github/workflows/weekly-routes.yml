@@ -1,0 +1,31 @@
+name: Weekly Cycling Routes
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # Every Monday at 6am UTC = ~8am Netherlands time
+  workflow_dispatch:      # Also allows manual trigger from GitHub UI
+
+jobs:
+  generate-routes:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests Pillow
+
+      - name: Generate routes and send email
+        env:
+          ORS_API_KEY: ${{ secrets.ORS_API_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM: ${{ secrets.RESEND_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          START_ADDRESS: 'Cremerstraat, Haarlem, Netherlands'
+        run: python generate_routes.py
