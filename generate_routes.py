@@ -101,24 +101,28 @@ def geojson_to_gpx(geojson, distance_km, date_str):
     summary = geojson['features'][0]['properties'].get('summary', {})
     actual_km = round(summary.get('distance', distance_km * 1000) / 1000, 1)
 
+    # Use <rte>/<rtept> (course/route format) — Garmin Connect requires this
+    # for planned routes. <trk>/<trkpt> is the activity/recording format.
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<gpx version="1.1" creator="WeeklyCyclingRoutes"',
-        '  xmlns="http://www.topografix.com/GPX/1/1">',
+        '  xmlns="http://www.topografix.com/GPX/1/1"',
+        '  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"',
+        '  xsi:schemaLocation="http://www.topografix.com/GPX/1/1'
+        ' http://www.topografix.com/GPX/1/1/gpx.xsd">',
         '  <metadata>',
         f'    <name>{distance_km}km Route – {date_str}</name>',
         f'    <desc>Round trip from Cremerstraat, Haarlem. Actual: {actual_km}km</desc>',
         f'    <time>{datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")}</time>',
         '  </metadata>',
-        '  <trk>',
-        f'    <name>{distance_km}km Cycling Route</name>',
-        '    <trkseg>',
+        '  <rte>',
+        f'    <name>{distance_km}km Cycling Route – Haarlem</name>',
     ]
     for c in coords:
         lon, lat = c[0], c[1]
         ele = c[2] if len(c) > 2 else 0
-        lines.append(f'      <trkpt lat="{lat:.6f}" lon="{lon:.6f}"><ele>{ele:.1f}</ele></trkpt>')
-    lines += ['    </trkseg>', '  </trk>', '</gpx>']
+        lines.append(f'    <rtept lat="{lat:.6f}" lon="{lon:.6f}"><ele>{ele:.1f}</ele></rtept>')
+    lines += ['  </rte>', '</gpx>']
     return '\n'.join(lines), actual_km
 
 
@@ -139,13 +143,14 @@ def render_route_image(geojson, distance_km, actual_km, geoapify_key=''):
 
 def _render_geoapify(coords, distance_km, actual_km, api_key):
     """Fetch a static map image from Geoapify with the route drawn on it."""
+    import urllib.request as urlreq
     try:
         lons = [c[0] for c in coords]
         lats = [c[1] for c in coords]
 
-        # Keep max 25 points — build URL directly to avoid requests double-encoding '|'
-        step = max(1, len(coords) // 25)
-        simplified = coords[::step][:25]
+        # Keep max 20 points
+        step = max(1, len(coords) // 20)
+        simplified = coords[::step][:20]
 
         polyline_pts = '|'.join(f'{c[0]:.4f},{c[1]:.4f}' for c in simplified)
 
@@ -156,18 +161,22 @@ def _render_geoapify(coords, distance_km, actual_km, api_key):
         cy = (min(lats) + max(lats)) / 2
         sx, sy = coords[0][0], coords[0][1]
 
+        # Use urllib so the URL is sent as-is (requests re-encodes '|' → '%7C')
         url = (
             f"https://maps.geoapify.com/v1/staticmap"
             f"?style=osm-bright&width=800&height=560&zoom={zoom}"
             f"&center=lonlat:{cx:.4f},{cy:.4f}"
-            f"&geometry=polyline:E74C3C,4,0.9|{polyline_pts}"
+            f"&geometry=polyline:E74C3C,4,1|{polyline_pts}"
             f"&marker=lonlat:{sx:.4f},{sy:.4f};type:circle;color:%23E74C3C;size:medium"
             f"&apiKey={api_key}"
         )
 
-        r = requests.get(url, timeout=20)
-        r.raise_for_status()
-        return r.content
+        req = urlreq.Request(url, headers={'User-Agent': 'WeeklyCyclingRoutes/1.0'})
+        with urlreq.urlopen(req, timeout=20) as resp:
+            if resp.status == 200:
+                return resp.read()
+            print(f"  Geoapify HTTP {resp.status}")
+            return None
     except Exception as e:
         print(f"  Geoapify error: {e}")
         return None
@@ -261,11 +270,21 @@ def send_email(cfg, routes_data, date_str, week_folder):
 
     html = EMAIL_HEADER.format(date=date_str) + '\n'.join(blocks) + EMAIL_FOOTER
 
+    # Attach GPX files so mobile users can open directly in Garmin Connect
+    attachments = []
+    for dist, gpx_str, _img, _actual, _url in routes_data:
+        attachments.append({
+            "filename":     f"haarlem_{dist}km.gpx",
+            "content":      base64.b64encode(gpx_str.encode('utf-8')).decode('ascii'),
+            "content_type": "application/gpx+xml",
+        })
+
     payload = {
-        "from":    cfg['resend_from'],
-        "to":      [cfg['email_to']],
-        "subject": f"🚴 Cycling routes – {date_str}",
-        "html":    html,
+        "from":        cfg['resend_from'],
+        "to":          [cfg['email_to']],
+        "subject":     f"🚴 Cycling routes – {date_str}",
+        "html":        html,
+        "attachments": attachments,
     }
 
     r = requests.post(
