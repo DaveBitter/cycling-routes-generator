@@ -41,16 +41,18 @@ def load_config():
     """Load from env vars (GitHub Actions) or config.json (local)."""
     if os.environ.get('ORS_API_KEY'):
         return {
-            'ors_api_key':    os.environ['ORS_API_KEY'],
-            'resend_api_key': os.environ['RESEND_API_KEY'],
-            'resend_from':    os.environ.get('RESEND_FROM', 'onboarding@resend.dev'),
-            'email_to':       os.environ.get('EMAIL_TO', 'daveybitter@gmail.com'),
-            'start_address':  os.environ.get('START_ADDRESS', 'Cremerstraat, Haarlem, Netherlands'),
-            'github_repo':    os.environ.get('GITHUB_REPOSITORY', ''),
+            'ors_api_key':       os.environ['ORS_API_KEY'],
+            'resend_api_key':    os.environ['RESEND_API_KEY'],
+            'resend_from':       os.environ.get('RESEND_FROM', 'onboarding@resend.dev'),
+            'email_to':          os.environ.get('EMAIL_TO', 'daveybitter@gmail.com'),
+            'start_address':     os.environ.get('START_ADDRESS', 'Cremerstraat, Haarlem, Netherlands'),
+            'github_repo':       os.environ.get('GITHUB_REPOSITORY', ''),
+            'geoapify_api_key':  os.environ.get('GEOAPIFY_API_KEY', ''),
         }
     with open(CONFIG_PATH) as f:
         cfg = json.load(f)
     cfg.setdefault('github_repo', '')
+    cfg.setdefault('geoapify_api_key', '')
     return cfg
 
 
@@ -73,7 +75,7 @@ def generate_route(start_lat, start_lon, distance_km, seed, api_key):
         "options": {
             "round_trip": {
                 "length": distance_km * 1000,
-                "points": max(3, distance_km // 12),
+                "points": 2,
                 "seed": seed,
             },
             "avoid_features": ["ferries", "steps"],
@@ -113,46 +115,88 @@ def geojson_to_gpx(geojson, distance_km, date_str):
     return '\n'.join(lines), actual_km
 
 
-# ─── Map rendering (matplotlib, no external tile servers) ────────────────────
+# ─── Map rendering ───────────────────────────────────────────────────────────
 
-def render_route_image(geojson, distance_km, actual_km):
-    """Render a clean route map using matplotlib. No tile fetching needed."""
+def render_route_image(geojson, distance_km, actual_km, geoapify_key=''):
+    """Try Geoapify static map first; fall back to matplotlib."""
+    coords = geojson['features'][0]['geometry']['coordinates']
+
+    if geoapify_key:
+        img = _render_geoapify(coords, distance_km, actual_km, geoapify_key)
+        if img:
+            return img
+        print("  Geoapify failed, falling back to matplotlib")
+
+    return _render_matplotlib(coords, distance_km, actual_km)
+
+
+def _render_geoapify(coords, distance_km, actual_km, api_key):
+    """Fetch a static map image from Geoapify with the route drawn on it."""
+    try:
+        lons = [c[0] for c in coords]
+        lats = [c[1] for c in coords]
+
+        # Reduce to ~80 points so the URL stays short
+        step = max(1, len(coords) // 80)
+        simplified = coords[::step]
+        if coords[-1] not in simplified:
+            simplified.append(coords[-1])
+
+        # Geoapify uses lon,lat order
+        polyline_pts = '|'.join(f'{c[0]:.5f},{c[1]:.5f}' for c in simplified)
+
+        # Pick zoom based on route extent
+        span = max(max(lats) - min(lats), max(lons) - min(lons))
+        zoom = 13 if span < 0.05 else 12 if span < 0.1 else 11 if span < 0.2 else 10 if span < 0.4 else 9
+
+        center_lon = (min(lons) + max(lons)) / 2
+        center_lat = (min(lats) + max(lats)) / 2
+        start_lon, start_lat = coords[0][0], coords[0][1]
+
+        params = {
+            'style':    'osm-bright',
+            'width':    800,
+            'height':   560,
+            'zoom':     zoom,
+            'center':   f'lonlat:{center_lon:.5f},{center_lat:.5f}',
+            'geometry': f'polyline:E74C3C,4,0.9|{polyline_pts}',
+            'marker':   f'lonlat:{start_lon:.5f},{start_lat:.5f};type:circle;color:%23E74C3C;size:medium',
+            'apiKey':   api_key,
+        }
+
+        r = requests.get('https://maps.geoapify.com/v1/staticmap',
+                         params=params, timeout=20)
+        r.raise_for_status()
+        return r.content
+    except Exception as e:
+        print(f"  Geoapify error: {e}")
+        return None
+
+
+def _render_matplotlib(coords, distance_km, actual_km):
+    """Fallback: clean route chart with matplotlib (no tile server needed)."""
     if not IMAGING:
         return None
     try:
-        coords = geojson['features'][0]['geometry']['coordinates']
         lons = [c[0] for c in coords]
         lats = [c[1] for c in coords]
 
         fig, ax = plt.subplots(figsize=(10, 6.5))
         fig.patch.set_facecolor('#1a1a2e')
         ax.set_facecolor('#16213e')
-
-        # Route line with glow effect
         ax.plot(lons, lats, '-', color='#ff6b6b', linewidth=1.5, alpha=0.3, zorder=2)
         ax.plot(lons, lats, '-', color='#ff6b6b', linewidth=2.5, zorder=3)
-
-        # Start/end marker
         ax.plot(lons[0], lats[0], 'o', color='white', markersize=10,
                 markeredgecolor='#ff6b6b', markeredgewidth=2, zorder=5)
-
-        # Style
         ax.set_aspect('equal')
         ax.tick_params(colors='#666', labelsize=7)
         for spine in ax.spines.values():
             spine.set_edgecolor('#333')
         ax.grid(True, color='#ffffff', alpha=0.05, linewidth=0.5)
-
-        # Labels
-        ax.set_title(f'{distance_km}km route  ·  actual {actual_km}km  ·  Cremerstraat, Haarlem',
+        ax.set_title(f'{distance_km}km · actual {actual_km}km · Cremerstraat, Haarlem',
                      color='#cccccc', fontsize=11, pad=10)
-        ax.set_xlabel('lon', color='#555', fontsize=7)
-        ax.set_ylabel('lat', color='#555', fontsize=7)
-
-        # Compass rose (simple N indicator)
         ax.annotate('N ↑', xy=(0.97, 0.97), xycoords='axes fraction',
                     ha='right', va='top', color='#888', fontsize=9)
-
         plt.tight_layout()
         buf = io.BytesIO()
         plt.savefig(buf, format='PNG', dpi=130, bbox_inches='tight',
@@ -161,7 +205,7 @@ def render_route_image(geojson, distance_km, actual_km):
         buf.seek(0)
         return buf.getvalue()
     except Exception as e:
-        print(f"  Map render failed: {e}")
+        print(f"  matplotlib render failed: {e}")
         return None
 
 
@@ -266,7 +310,8 @@ def main():
         try:
             geojson = generate_route(start_lat, start_lon, dist, seed, api_key)
             gpx_str, actual_km = geojson_to_gpx(geojson, dist, date_str)
-            img_bytes = render_route_image(geojson, dist, actual_km)
+            img_bytes = render_route_image(geojson, dist, actual_km,
+                                           cfg.get('geoapify_api_key', ''))
 
             filename = f"haarlem_{dist}km.gpx"
             gpx_path = os.path.join(gpx_dir, filename)

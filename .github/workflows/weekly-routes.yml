@@ -31,6 +31,7 @@ jobs:
           EMAIL_TO:           ${{ secrets.EMAIL_TO }}
           START_ADDRESS:      'Cremerstraat, Haarlem, Netherlands'
           GITHUB_REPOSITORY:  ${{ github.repository }}
+          GEOAPIFY_API_KEY:   ${{ secrets.GEOAPIFY_API_KEY }}
         run: python generate_routes.py
 
       - name: Commit GPX files to repo
