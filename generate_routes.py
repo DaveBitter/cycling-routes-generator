@@ -82,11 +82,18 @@ def generate_route(start_lat, start_lon, distance_km, seed, api_key):
         },
         "preference": "recommended",
     }
-    r = requests.post(url,
-                      headers={"Authorization": api_key, "Content-Type": "application/json"},
-                      json=body, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    for attempt in range(3):
+        try:
+            r = requests.post(url,
+                              headers={"Authorization": api_key, "Content-Type": "application/json"},
+                              json=body, timeout=30)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            if attempt == 2:
+                raise
+            print(f"  ORS attempt {attempt+1} failed ({e}), retrying...")
+            import time; time.sleep(3)
 
 
 def geojson_to_gpx(geojson, distance_km, date_str):
@@ -136,36 +143,29 @@ def _render_geoapify(coords, distance_km, actual_km, api_key):
         lons = [c[0] for c in coords]
         lats = [c[1] for c in coords]
 
-        # Reduce to ~80 points so the URL stays short
-        step = max(1, len(coords) // 80)
-        simplified = coords[::step]
-        if coords[-1] not in simplified:
-            simplified.append(coords[-1])
+        # Keep max 25 points — build URL directly to avoid requests double-encoding '|'
+        step = max(1, len(coords) // 25)
+        simplified = coords[::step][:25]
 
-        # Geoapify uses lon,lat order
-        polyline_pts = '|'.join(f'{c[0]:.5f},{c[1]:.5f}' for c in simplified)
+        polyline_pts = '|'.join(f'{c[0]:.4f},{c[1]:.4f}' for c in simplified)
 
-        # Pick zoom based on route extent
         span = max(max(lats) - min(lats), max(lons) - min(lons))
         zoom = 13 if span < 0.05 else 12 if span < 0.1 else 11 if span < 0.2 else 10 if span < 0.4 else 9
 
-        center_lon = (min(lons) + max(lons)) / 2
-        center_lat = (min(lats) + max(lats)) / 2
-        start_lon, start_lat = coords[0][0], coords[0][1]
+        cx = (min(lons) + max(lons)) / 2
+        cy = (min(lats) + max(lats)) / 2
+        sx, sy = coords[0][0], coords[0][1]
 
-        params = {
-            'style':    'osm-bright',
-            'width':    800,
-            'height':   560,
-            'zoom':     zoom,
-            'center':   f'lonlat:{center_lon:.5f},{center_lat:.5f}',
-            'geometry': f'polyline:E74C3C,4,0.9|{polyline_pts}',
-            'marker':   f'lonlat:{start_lon:.5f},{start_lat:.5f};type:circle;color:%23E74C3C;size:medium',
-            'apiKey':   api_key,
-        }
+        url = (
+            f"https://maps.geoapify.com/v1/staticmap"
+            f"?style=osm-bright&width=800&height=560&zoom={zoom}"
+            f"&center=lonlat:{cx:.4f},{cy:.4f}"
+            f"&geometry=polyline:E74C3C,4,0.9|{polyline_pts}"
+            f"&marker=lonlat:{sx:.4f},{sy:.4f};type:circle;color:%23E74C3C;size:medium"
+            f"&apiKey={api_key}"
+        )
 
-        r = requests.get('https://maps.geoapify.com/v1/staticmap',
-                         params=params, timeout=20)
+        r = requests.get(url, timeout=20)
         r.raise_for_status()
         return r.content
     except Exception as e:
